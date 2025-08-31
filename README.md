@@ -6,6 +6,7 @@
 #include <Adafruit_VL53L0X.h>
 #include "mavlink/common/mavlink.h"
 
+// ---------------- CAMERA PINS ----------------
 #define PWDN_GPIO_NUM    -1
 #define RESET_GPIO_NUM   -1
 #define XCLK_GPIO_NUM     0
@@ -23,23 +24,29 @@
 #define HREF_GPIO_NUM    23
 #define PCLK_GPIO_NUM    22
 
+// ---------------- WIFI ----------------
 const char* ssid = "ESP32CAM_Drone";
 const char* password = "esp32pixhawk";
 
+// ---------------- MAVLINK UART ----------------
 HardwareSerial PixSerial(2);
 #define RXD2 16
 #define TXD2 17
 
+// ---------------- TOF SENSOR ----------------
 Adafruit_VL53L0X lox = Adafruit_VL53L0X();
 bool tof_ready = false;
 
+// ---------------- WEB SERVER ----------------
 WebServer server(80);
 
+// ---------------- STATE ----------------
 bool g_armed = false;
 bool g_line_follow_enabled = false;
 bool g_obstacle_enabled = false;
 int g_base_throttle = 1400;
 
+// ---------------- HTML PAGE ----------------
 const char* INDEX_HTML PROGMEM = R"rawliteral(
 <!DOCTYPE html>
 <html>
@@ -88,6 +95,7 @@ document.getElementById("micBtn").onclick=()=>{
 </html>
 )rawliteral";
 
+// ---------------- MAVLINK HELPERS ----------------
 void sendRcOverride(int roll, int pitch, int throttle, int yaw) {
   mavlink_message_t msg;
   uint8_t buf[MAVLINK_MAX_PACKET_LEN];
@@ -99,6 +107,7 @@ void sendRcOverride(int roll, int pitch, int throttle, int yaw) {
   PixSerial.write(buf, len);
 }
 
+// ---------------- CAMERA STREAM ----------------
 void handleJpgStream(void) {
   WiFiClient client = server.client();
   String response = "HTTP/1.1 200 OK\r\n";
@@ -114,6 +123,7 @@ void handleJpgStream(void) {
   }
 }
 
+// ---------------- LINE FOLLOW ----------------
 void lineFollow() {
   camera_fb_t * fb = esp_camera_fb_get();
   if (!fb) return;
@@ -134,6 +144,7 @@ void lineFollow() {
   sendRcOverride(roll, 1500, throttle, 1500);
 }
 
+// ---------------- OBSTACLE ----------------
 void checkObstacle() {
   if (!tof_ready) return;
   VL53L0X_RangingMeasurementData_t measure;
@@ -143,6 +154,7 @@ void checkObstacle() {
   }
 }
 
+// ---------------- API HANDLERS ----------------
 void handleRoot() { server.send(200, "text/html", INDEX_HTML); }
 void handleVoice() {
   if (server.hasArg("cmd")) {
@@ -174,6 +186,7 @@ void startCameraServer() {
   server.begin();
 }
 
+// ---------------- SETUP ----------------
 void setup() {
   Serial.begin(115200);
   PixSerial.begin(57600, SERIAL_8N1, RXD2, TXD2);
@@ -218,6 +231,7 @@ void setup() {
   startCameraServer();
 }
 
+// ---------------- LOOP ----------------
 void loop() {
   server.handleClient();
 
