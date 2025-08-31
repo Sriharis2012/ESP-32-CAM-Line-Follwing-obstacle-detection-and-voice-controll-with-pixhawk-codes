@@ -1,15 +1,11 @@
 #include "esp_camera.h"
 #include <WiFi.h>
 #include <WebServer.h>
-#include <esp_timer.h>
-#include <Arduino.h>
 #include <HardwareSerial.h>
-#include "FS.h"
-#include "soc/soc.h"
-#include "soc/rtc_cntl_reg.h"
 #include <Wire.h>
+#include <Adafruit_VL53L0X.h>
+#include "mavlink/common/mavlink.h"
 
-// ---------------- CAMERA PINS ----------------
 #define PWDN_GPIO_NUM    -1
 #define RESET_GPIO_NUM   -1
 #define XCLK_GPIO_NUM     0
@@ -27,25 +23,23 @@
 #define HREF_GPIO_NUM    23
 #define PCLK_GPIO_NUM    22
 
-// ---------------- WIFI ----------------
 const char* ssid = "ESP32CAM_Drone";
 const char* password = "esp32pixhawk";
 
-// ---------------- MAVLINK UART ----------------
-HardwareSerial PixSerial(2); // UART2 for Pixhawk
+HardwareSerial PixSerial(2);
 #define RXD2 16
 #define TXD2 17
 
-// ---------------- WEB SERVER ----------------
+Adafruit_VL53L0X lox = Adafruit_VL53L0X();
+bool tof_ready = false;
+
 WebServer server(80);
 
-// ---------------- STATE FLAGS ----------------
 bool g_armed = false;
 bool g_line_follow_enabled = false;
 bool g_obstacle_enabled = false;
 int g_base_throttle = 1400;
 
-// ---------------- HTML PAGE ----------------
 const char* INDEX_HTML PROGMEM = R"rawliteral(
 <!DOCTYPE html>
 <html>
@@ -74,9 +68,7 @@ button { padding:12px; margin:6px; border-radius:12px; font-size:18px;}
 <button id="micBtn">🎤 Voice</button>
 <p id="voiceStatus">Voice: idle</p>
 <script>
-function sendCmd(cmd){
- fetch('/api/'+cmd).then(r=>console.log(cmd));
-}
+function sendCmd(cmd){ fetch('/api/'+cmd); }
 let recognition;
 if('webkitSpeechRecognition' in window){
  recognition=new webkitSpeechRecognition();
@@ -96,7 +88,61 @@ document.getElementById("micBtn").onclick=()=>{
 </html>
 )rawliteral";
 
-// ---------------- HANDLERS ----------------
+void sendRcOverride(int roll, int pitch, int throttle, int yaw) {
+  mavlink_message_t msg;
+  uint8_t buf[MAVLINK_MAX_PACKET_LEN];
+  
+  mavlink_msg_rc_channels_override_pack(
+      1, 200, &msg, 1, 0, roll, pitch, throttle, yaw, 0, 0, 0, 0);
+  
+  uint16_t len = mavlink_msg_to_send_buffer(buf, &msg);
+  PixSerial.write(buf, len);
+}
+
+void handleJpgStream(void) {
+  WiFiClient client = server.client();
+  String response = "HTTP/1.1 200 OK\r\n";
+  response += "Content-Type: multipart/x-mixed-replace; boundary=frame\r\n\r\n";
+  server.sendContent(response);
+  while (client.connected()) {
+    camera_fb_t * fb = esp_camera_fb_get();
+    if (!fb) continue;
+    server.sendContent("--frame\r\nContent-Type: image/jpeg\r\n\r\n");
+    client.write(fb->buf, fb->len);
+    server.sendContent("\r\n");
+    esp_camera_fb_return(fb);
+  }
+}
+
+void lineFollow() {
+  camera_fb_t * fb = esp_camera_fb_get();
+  if (!fb) return;
+
+  int leftSum=0, rightSum=0;
+  int width = 160; // scaled down
+  int step = fb->len / width;
+  for (int i=0; i<width; i++) {
+    uint8_t val = fb->buf[i*step];
+    if (i < width/2) leftSum += val;
+    else rightSum += val;
+  }
+  esp_camera_fb_return(fb);
+
+  int error = leftSum - rightSum;
+  int roll = 1500 + error/50;
+  int throttle = g_base_throttle;
+  sendRcOverride(roll, 1500, throttle, 1500);
+}
+
+void checkObstacle() {
+  if (!tof_ready) return;
+  VL53L0X_RangingMeasurementData_t measure;
+  lox.rangingTest(&measure, false);
+  if (measure.RangeMilliMeter < 800 && measure.RangeStatus == 0) {
+    sendRcOverride(1500, 1500, 1200, 1500); // stop/hover
+  }
+}
+
 void handleRoot() { server.send(200, "text/html", INDEX_HTML); }
 void handleVoice() {
   if (server.hasArg("cmd")) {
@@ -113,23 +159,6 @@ void handleVoice() {
   server.send(200,"text/plain","OK");
 }
 
-// ---------------- CAMERA STREAM ----------------
-void handleJpgStream(void) {
-  WiFiClient client = server.client();
-  String response = "HTTP/1.1 200 OK\r\n";
-  response += "Content-Type: multipart/x-mixed-replace; boundary=frame\r\n\r\n";
-  server.sendContent(response);
-  while (client.connected()) {
-    camera_fb_t * fb = esp_camera_fb_get();
-    if (!fb) continue;
-    server.sendContent("--frame\r\nContent-Type: image/jpeg\r\n\r\n");
-    client.write(fb->buf, fb->len);
-    server.sendContent("\r\n");
-    esp_camera_fb_return(fb);
-  }
-}
-
-// ---------------- SETUP ----------------
 void startCameraServer() {
   server.on("/", handleRoot);
   server.on("/stream", HTTP_GET, [](){ handleJpgStream(); });
@@ -146,7 +175,6 @@ void startCameraServer() {
 }
 
 void setup() {
-  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0); // disable brownout
   Serial.begin(115200);
   PixSerial.begin(57600, SERIAL_8N1, RXD2, TXD2);
 
@@ -173,16 +201,35 @@ void setup() {
   config.pin_reset = RESET_GPIO_NUM;
   config.xclk_freq_hz = 20000000;
   config.pixel_format = PIXFORMAT_JPEG;
-  config.frame_size = FRAMESIZE_QVGA;
+  config.frame_size = FRAMESIZE_QQVGA;
   config.jpeg_quality = 12;
-  config.fb_count = 2;
+  config.fb_count = 1;
 
-  if (esp_camera_init(&config) != ESP_OK) return;
+  if (esp_camera_init(&config) != ESP_OK) {
+    Serial.println("Camera init failed");
+    return;
+  }
+
+  if (lox.begin()) {
+    tof_ready = true;
+    Serial.println("TOF ready");
+  }
 
   startCameraServer();
 }
 
 void loop() {
   server.handleClient();
-  // TODO: Add MAVLink RC override / line-following logic here
+
+  if (g_armed) {
+    if (g_line_follow_enabled) {
+      lineFollow();
+    } else {
+      sendRcOverride(1500, 1500, g_base_throttle, 1500); // hover
+    }
+
+    if (g_obstacle_enabled) {
+      checkObstacle();
+    }
+  }
 }
